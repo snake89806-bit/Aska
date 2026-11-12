@@ -123,9 +123,9 @@ class OscarClient {
                 session(addr, cookie)
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "session error", e)
-                if (!closing) error.value = e.message ?: "Соединение разорвано"
+                if (!closing) error.value = e.javaClass.simpleName + ": " + (e.message ?: "соединение разорвано")
             } finally {
                 bos?.close(); bos = null
                 contacts.update { l -> l.map { it.copy(status = OFFLINE) } }
@@ -206,7 +206,7 @@ class OscarClient {
         while (true) {
             val f = c.read()
             when (f.channel) {
-                2 -> try { onSnac(f.data) } catch (e: Exception) { Log.w(TAG, "bad snac", e) }
+                2 -> try { onSnac(f.data) } catch (e: Throwable) { Log.w(TAG, "bad snac", e) }
                 4 -> return
             }
         }

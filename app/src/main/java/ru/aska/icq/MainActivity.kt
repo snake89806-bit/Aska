@@ -2,6 +2,12 @@ package ru.aska.icq
 
 import android.content.SharedPreferences
 import android.os.Bundle
+import java.io.File
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -68,6 +74,15 @@ fun App() {
         }
     }
     LaunchedEffect(conn) { if (conn != Conn.ON) chat = null }
+
+    val ctx = LocalContext.current
+    val crashFile = remember { File(ctx.filesDir, "crash.txt") }
+    var crash by remember { mutableStateOf(if (crashFile.exists()) crashFile.readText() else null) }
+    val crashText = crash
+    if (crashText != null) {
+        CrashScreen(crashText) { crashFile.delete(); crash = null }
+        return
+    }
 
     val open = chat
     when {
@@ -194,6 +209,22 @@ fun ChatScreen(uin: String, onBack: () -> Unit) {
             OutlinedTextField(text, { text = it }, placeholder = { Text("Сообщение") }, modifier = Modifier.weight(1f))
             Spacer(Modifier.width(8.dp))
             Button(onClick = { oscar.sendMessage(uin, text); text = "" }, enabled = text.isNotBlank()) { Text("➤") }
+        }
+    }
+}
+
+@Composable
+fun CrashScreen(text: String, onClose: () -> Unit) {
+    val clip = LocalClipboardManager.current
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("Прошлый запуск закончился ошибкой", style = MaterialTheme.typography.titleMedium)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { clip.setText(AnnotatedString(text)) }) { Text("Скопировать") }
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = onClose) { Text("Продолжить") }
+        }
+        SelectionContainer(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+            Text(text.take(4000), style = MaterialTheme.typography.bodySmall)
         }
     }
 }
