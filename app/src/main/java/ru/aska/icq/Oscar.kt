@@ -35,7 +35,7 @@ class W {
 }
 
 /** Чтение байтов (big-endian). */
-class R(private val b: ByteArray, var p: Int = 0) {
+class ByteReader(private val b: ByteArray, var p: Int = 0) {
     val left get() = b.size - p
     fun u8() = b[p++].toInt() and 0xFF
     fun u16(): Int { val h = u8(); return (h shl 8) or u8() }
@@ -176,7 +176,7 @@ class OscarClient {
             while (true) {
                 val f = c.read()
                 if (f.channel != 4) continue
-                val r = R(f.data)
+                val r = ByteReader(f.data)
                 var addr: String? = null
                 var cookie: ByteArray? = null
                 var err = -1
@@ -217,7 +217,7 @@ class OscarClient {
     }
 
     private fun onSnac(data: ByteArray) {
-        val r = R(data)
+        val r = ByteReader(data)
         val fam = r.u16(); val sub = r.u16(); r.u16(); r.skip(4)
         Log.d(TAG, "SNAC %04x,%04x".format(fam, sub))
         when ((fam shl 16) or sub) {
@@ -259,7 +259,7 @@ class OscarClient {
         contacts.update { l -> l.map { if (it.uin == name) it.copy(status = st) else it } }
     }
 
-    private fun onMessage(r: R) {
+    private fun onMessage(r: ByteReader) {
         r.skip(8)
         val ch = r.u16(); val from = r.str(r.u8()); r.u16()
         repeat(r.u16()) { r.u16(); r.skip(r.u16()) }
@@ -267,7 +267,7 @@ class OscarClient {
         while (r.left >= 4) {
             val t = r.u16(); val v = r.bytes(r.u16())
             if (t != 2) continue
-            val f = R(v)
+            val f = ByteReader(v)
             while (f.left >= 4) {
                 val id = f.u8(); f.u8(); val fd = f.bytes(f.u16())
                 if (id == 1 && fd.size >= 4) {
