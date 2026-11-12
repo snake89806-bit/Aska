@@ -2,6 +2,7 @@ package ru.aska.icq
 
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import java.io.ByteArrayOutputStream
@@ -19,7 +20,9 @@ const val ST_INVISIBLE = 0x0100
 
 data class Contact(val uin: String, val status: Int = OFFLINE)
 data class Msg(val mine: Boolean, val text: String)
-enum class Conn { OFF, CONNECTING, ON }
+enum class Conn { OFF, CONNECTING, ON, RECONNECTING }
+
+class AuthRejected(msg: String) : Exception(msg)
 
 /** Запись байтов (big-endian). */
 class W {
@@ -58,6 +61,7 @@ class FlapConnection(host: String, port: Int, timeoutMs: Int = 0) : Closeable {
     init {
         socket.connect(InetSocketAddress(host, port), 8000)
         socket.tcpNoDelay = true
+        socket.keepAlive = true
         socket.soTimeout = timeoutMs
         input = DataInputStream(socket.getInputStream().buffered())
     }
@@ -90,6 +94,29 @@ private fun roast(p: String) = ByteArray(p.length) { (p[it].code xor ROAST[it % 
 private fun u16b(v: Int) = W().u16(v).done()
 private fun u32b(v: Long) = W().u32(v).done()
 
+private val FAMILIES = listOf(1 to 4, 2 to 1, 3 to 1, 4 to 1, 9 to 1, 0x13 to 4)
+
+/** Элемент серверного списка контактов (SSI). type: 0 = контакт, 1 = группа. */
+private class SsiItem(val name: String, val gid: Int, val id: Int, val type: Int, val data: ByteArray) {
+    fun encode(): ByteArray {
+        val n = name.toByteArray(Charsets.UTF_8)
+        return W().u16(n.size).bytes(n).u16(gid).u16(id).u16(type).u16(data.size).bytes(data).done()
+    }
+
+    fun members(): List<Int> {
+        val out = mutableListOf<Int>()
+        val r = ByteReader(data)
+        while (r.left >= 4) {
+            val t = r.u16(); val v = r.bytes(r.u16())
+            if (t == 0xC8) { val m = ByteReader(v); while (m.left >= 2) out += m.u16() }
+        }
+        return out
+    }
+}
+
+private fun memberData(ids: List<Int>): ByteArray =
+    if (ids.isEmpty()) ByteArray(0) else W().tlv(0xC8, W().apply { ids.forEach { u16(it) } }.done()).done()
+
 private const val CLIENT_ID = "ICQ Inc. - Product of ICQ (TM).2000b.4.63.1.3279.85"
 private const val TAG = "Aska"
 
@@ -100,12 +127,21 @@ class OscarClient {
     val chats = MutableStateFlow<Map<String, List<Msg>>>(emptyMap())
     val myStatus = MutableStateFlow(ST_ONLINE)
 
+    val unread = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val incoming = MutableSharedFlow<Pair<String, String>>(extraBufferCapacity = 32)
+    @Volatile var appVisible = false
+    @Volatile var openChat: String? = null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var generation = 0
+    private var everOn = false
     private var job: Job? = null
     private var bos: FlapConnection? = null
     private var req = 1
     private var closing = false
     private var started = false
+    private var finished = false
+    private val ssi = mutableListOf<SsiItem>()
 
     @Synchronized private fun nextReq() = req++
 
@@ -113,34 +149,74 @@ class OscarClient {
 
     fun connect(host: String, uin: String, pass: String) {
         job?.cancel()
+        bos?.close()
         closing = false
-        started = false
+        everOn = false
+        val gen = ++generation
         conn.value = Conn.CONNECTING
         error.value = null
         job = scope.launch {
-            try {
-                val (addr, cookie) = authenticate(host, uin, pass)
-                session(addr, cookie)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Throwable) {
-                Log.e(TAG, "session error", e)
-                if (!closing) error.value = e.javaClass.simpleName + ": " + (e.message ?: "соединение разорвано")
-            } finally {
-                bos?.close(); bos = null
-                contacts.update { l -> l.map { it.copy(status = OFFLINE) } }
-                conn.value = Conn.OFF
+            var wait = 3000L
+            while (isActive) {
+                started = false
+                finished = false
+                val ping = launch {
+                    while (true) {
+                        delay(60_000)
+                        try { bos?.send(5, ByteArray(0)) } catch (_: Throwable) {}
+                    }
+                }
+                var stop = false
+                try {
+                    val (addr, cookie) = authenticate(host, uin, pass)
+                    session(addr, cookie)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Log.e(TAG, "session error", e)
+                    if (!closing) error.value = e.javaClass.simpleName + ": " + (e.message ?: "соединение разорвано")
+                    if (e is AuthRejected) stop = true
+                } finally {
+                    ping.cancel()
+                    bos?.close(); bos = null
+                    contacts.update { l -> l.map { it.copy(status = OFFLINE) } }
+                }
+                if (closing || stop || !everOn) break
+                conn.value = Conn.RECONNECTING
+                delay(wait)
+                wait = minOf(wait * 2, 60_000L)
             }
+            if (gen == generation) conn.value = Conn.OFF
         }
     }
 
-    fun disconnect() { closing = true; bos?.close(); job?.cancel() }
+    fun disconnect() {
+        closing = true
+        generation++
+        bos?.close()
+        job?.cancel()
+        conn.value = Conn.OFF
+    }
+
+    fun clearUnread(uin: String) { unread.update { it - uin } }
 
     fun addContact(uin: String) {
         val u = uin.trim()
         if (u.isEmpty() || contacts.value.any { it.uin == u }) return
         contacts.update { it + Contact(u) }
-        if (conn.value == Conn.ON) scope.launch { send(3, 4, W().u8(u.length).str(u).done()) }
+        if (conn.value == Conn.ON) scope.launch {
+            send(3, 4, W().u8(u.length).str(u).done())
+            ssiAdd(listOf(u))
+        }
+    }
+
+    fun removeContact(uin: String) {
+        contacts.update { l -> l.filter { it.uin != uin } }
+        unread.update { it - uin }
+        if (conn.value == Conn.ON) scope.launch {
+            send(3, 5, W().u8(uin.length).str(uin).done())
+            ssiRemove(uin)
+        }
     }
 
     fun setMyStatus(code: Int) {
@@ -189,7 +265,7 @@ class OscarClient {
                     }
                 }
                 if (addr == null || cookie == null)
-                    throw Exception("Сервер отказал во входе (код $err). Проверьте номер и пароль.")
+                    throw AuthRejected("Сервер отказал во входе (код $err). Проверьте номер и пароль.")
                 return addr to cookie
             }
         }
@@ -201,6 +277,7 @@ class OscarClient {
         val port = addr.substringAfter(':', "5190").toInt()
         val c = FlapConnection(host, port)
         bos = c
+        synchronized(this) { ssi.clear() }
         c.read() // приветствие BOS
         c.send(1, W().u32(1).tlv(6, cookie).done())
         while (true) {
@@ -218,16 +295,21 @@ class OscarClient {
 
     private fun onSnac(data: ByteArray) {
         val r = ByteReader(data)
-        val fam = r.u16(); val sub = r.u16(); r.u16(); r.skip(4)
+        val fam = r.u16(); val sub = r.u16(); val flags = r.u16(); r.skip(4)
         Log.d(TAG, "SNAC %04x,%04x".format(fam, sub))
         when ((fam shl 16) or sub) {
             0x0001_0003 -> send(1, 0x17, W().apply {
-                listOf(1 to 4, 2 to 1, 3 to 1, 4 to 1, 9 to 1).forEach { u16(it.first); u16(it.second) }
+                FAMILIES.forEach { u16(it.first); u16(it.second) }
             }.done())
             0x0001_0018 -> send(1, 0x06)
             0x0001_0007 -> {
                 send(1, 0x08, W().apply { for (i in 1..5) u16(i) }.done())
-                if (!started) { started = true; finishLogin() }
+                if (!started) {
+                    started = true
+                    send(0x13, 2)
+                    send(0x13, 4)
+                    scope.launch { delay(5000); finishLogin() } // запасной вариант, если сервер не ответит
+                }
             }
             0x0003_000B -> {
                 val name = r.str(r.u8()); r.u16()
@@ -240,19 +322,95 @@ class OscarClient {
             }
             0x0003_000C -> setContactStatus(r.str(r.u8()), OFFLINE)
             0x0004_0007 -> onMessage(r)
+            0x0013_0006 -> ssiLoad(r, (flags and 1) != 0)
+            0x0013_000F -> onSsiLoaded()
         }
     }
 
+    @Synchronized
     private fun finishLogin() {
+        if (finished) return
+        finished = true
+        send(0x13, 7)
         send(2, 2); send(3, 2); send(4, 4); send(9, 2)
         send(4, 2, W().u16(0).u32(3).u16(512).u16(999).u16(999).u32(0).done())
         send(1, 0x1E, W().tlv(6, u32b(myStatus.value.toLong())).done())
         send(1, 0x02, W().apply {
-            listOf(1 to 4, 2 to 1, 3 to 1, 4 to 1, 9 to 1).forEach { u16(it.first); u16(it.second); u16(0x0110); u16(0x047B) }
+            FAMILIES.forEach { u16(it.first); u16(it.second); u16(0x0110); u16(0x047B) }
         }.done())
         val names = contacts.value
         if (names.isNotEmpty()) send(3, 4, W().apply { names.forEach { u8(it.uin.length); str(it.uin) } }.done())
+        everOn = true
+        error.value = null
         conn.value = Conn.ON
+    }
+
+    @Synchronized
+    private fun ssiLoad(r: ByteReader, more: Boolean) {
+        r.u8()
+        repeat(r.u16()) {
+            val name = String(r.bytes(r.u16()), Charsets.UTF_8)
+            val gid = r.u16(); val id = r.u16(); val type = r.u16()
+            val data = r.bytes(r.u16())
+            ssi += SsiItem(name, gid, id, type, data)
+        }
+        if (!more) onSsiLoaded()
+    }
+
+    private fun onSsiLoaded() {
+        if (finished) return
+        val server = synchronized(this) { ssi.filter { it.type == 0 }.map { it.name } }
+        contacts.update { cur -> cur + server.filter { s -> cur.none { it.uin == s } }.map { Contact(it) } }
+        val missing = contacts.value.map { it.uin }.filter { it !in server }
+        ssiAdd(missing)
+        finishLogin()
+    }
+
+    /** Добавляет контакты в серверный список (создаёт группу, если её ещё нет). */
+    @Synchronized
+    private fun ssiAdd(unis: List<String>) {
+        if (unis.isEmpty()) return
+        var nextId = maxOf(0x100, ssi.maxOfOrNull { maxOf(it.id, it.gid) } ?: 0) + 1
+        val root = ssi.firstOrNull { it.type == 1 && it.gid == 0 }
+        val group = ssi.firstOrNull { it.type == 1 && it.gid != 0 }
+        val gid = group?.gid ?: nextId++
+        val buddies = unis.map { SsiItem(it, gid, nextId++, 0, ByteArray(0)) }
+        val ids = (group?.members() ?: emptyList()) + buddies.map { it.id }
+        val groupItem = SsiItem(group?.name ?: "Buddies", gid, 0, 1, memberData(ids))
+        val adds = mutableListOf<SsiItem>()
+        val updates = mutableListOf<SsiItem>()
+        if (group == null) {
+            adds += groupItem
+            adds += buddies
+            val rootItem = SsiItem("", 0, 0, 1, memberData((root?.members() ?: emptyList()) + gid))
+            if (root == null) adds += rootItem else updates += rootItem
+        } else {
+            adds += buddies
+            updates += groupItem
+        }
+        send(0x13, 0x11)
+        send(0x13, 0x08, W().apply { adds.forEach { bytes(it.encode()) } }.done())
+        if (updates.isNotEmpty()) send(0x13, 0x09, W().apply { updates.forEach { bytes(it.encode()) } }.done())
+        send(0x13, 0x12)
+        val changed = adds + updates
+        ssi.removeAll { o -> changed.any { it.gid == o.gid && it.id == o.id && it.type == o.type } }
+        ssi += changed
+    }
+
+    @Synchronized
+    private fun ssiRemove(uin: String) {
+        val b = ssi.firstOrNull { it.type == 0 && it.name == uin } ?: return
+        val g = ssi.firstOrNull { it.type == 1 && it.gid == b.gid && it.id == 0 }
+        send(0x13, 0x11)
+        send(0x13, 0x0A, b.encode())
+        var newGroup: SsiItem? = null
+        if (g != null) {
+            newGroup = SsiItem(g.name, g.gid, 0, 1, memberData(g.members().filter { it != b.id }))
+            send(0x13, 0x09, newGroup.encode())
+        }
+        send(0x13, 0x12)
+        ssi.remove(b)
+        if (g != null && newGroup != null) { ssi.remove(g); ssi += newGroup }
     }
 
     private fun setContactStatus(name: String, st: Int) {
@@ -278,6 +436,8 @@ class OscarClient {
                     )
                     contacts.update { l -> if (l.any { it.uin == from }) l else l + Contact(from, ST_ONLINE) }
                     addMsg(from, Msg(false, text))
+                    if (!(appVisible && openChat == from)) unread.update { it + (from to ((it[from] ?: 0) + 1)) }
+                    incoming.tryEmit(from to text)
                 }
             }
         }

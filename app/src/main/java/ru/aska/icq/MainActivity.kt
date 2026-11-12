@@ -1,7 +1,21 @@
 package ru.aska.icq
 
 import android.content.SharedPreferences
+import android.Manifest
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Dp
+import kotlin.math.cos
+import kotlin.math.sin
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import java.io.File
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -35,12 +49,62 @@ import androidx.compose.ui.unit.dp
 val oscar = OscarClient()
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() { super.onStart(); oscar.appVisible = true }
+    override fun onStop() { oscar.appVisible = false; super.onStop() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+                .launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         setContent {
-            MaterialTheme {
+            MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF3F9E3A))) {
                 Surface(Modifier.fillMaxSize().systemBarsPadding().imePadding()) { App() }
             }
+        }
+    }
+}
+
+val AskaGreen = Color(0xFF3F9E3A)
+
+@Composable
+fun Flower(color: Color, dp: Dp = 22.dp) {
+    Canvas(Modifier.size(dp)) {
+        val r = size.minDimension / 2
+        for (i in 0 until 5) {
+            val a = Math.toRadians(i * 72.0 - 90)
+            drawCircle(
+                color, r * 0.37f,
+                Offset(center.x + (r * 0.62f * cos(a)).toFloat(), center.y + (r * 0.62f * sin(a)).toFloat())
+            )
+        }
+        drawCircle(Color.White.copy(alpha = 0.9f), r * 0.2f, center)
+    }
+}
+
+@Composable
+fun SectionTitle(text: String) {
+    Text(text, style = MaterialTheme.typography.labelLarge, color = AskaGreen,
+        modifier = Modifier.fillMaxWidth().background(Color(0xFFF1F8F0)).padding(horizontal = 16.dp, vertical = 6.dp))
+}
+
+@Composable
+fun ContactRow(c: Contact, n: Int, onOpen: (String) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable { onOpen(c.uin) }.padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Flower(statusColor(c.status), 24.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(c.uin, style = MaterialTheme.typography.bodyLarge)
+            Text(statusName(c.status), style = MaterialTheme.typography.bodySmall)
+        }
+        if (n > 0) Box(Modifier.clip(CircleShape).background(AskaGreen).padding(horizontal = 9.dp, vertical = 3.dp)) {
+            Text("$n", color = Color.White, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -62,7 +126,8 @@ fun statusColor(s: Int) = when {
 
 @Composable
 fun App() {
-    val prefs = LocalContext.current.getSharedPreferences("icq", 0)
+    val ctx = LocalContext.current
+    val prefs = ctx.getSharedPreferences("icq", 0)
     val conn by oscar.conn.collectAsState()
     var chat by remember { mutableStateOf<String?>(null) }
 
@@ -73,9 +138,15 @@ fun App() {
             prefs.edit().putStringSet("c", l.map { it.uin }.toSet()).apply()
         }
     }
-    LaunchedEffect(conn) { if (conn != Conn.ON) chat = null }
+    LaunchedEffect(conn) {
+        val svc = Intent(ctx, ConnService::class.java)
+        when (conn) {
+            Conn.OFF -> { chat = null; ctx.stopService(svc) }
+            Conn.CONNECTING -> ContextCompat.startForegroundService(ctx, svc)
+            else -> {}
+        }
+    }
 
-    val ctx = LocalContext.current
     val crashFile = remember { File(ctx.filesDir, "crash.txt") }
     var crash by remember { mutableStateOf(if (crashFile.exists()) crashFile.readText() else null) }
     val crashText = crash
@@ -86,7 +157,7 @@ fun App() {
 
     val open = chat
     when {
-        conn != Conn.ON -> LoginScreen(prefs)
+        conn == Conn.OFF || conn == Conn.CONNECTING -> LoginScreen(prefs)
         open == null -> ContactsScreen { chat = it }
         else -> {
             BackHandler { chat = null }
@@ -107,7 +178,11 @@ fun LoginScreen(prefs: SharedPreferences) {
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically)
     ) {
-        Text("🌼 Аська", style = MaterialTheme.typography.headlineLarge)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Flower(AskaGreen, 44.dp)
+            Spacer(Modifier.width(12.dp))
+            Text("Аська", style = MaterialTheme.typography.headlineLarge)
+        }
         OutlinedTextField(host, { host = it }, label = { Text("Сервер (IP компьютера)") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(uin, { uin = it.filter(Char::isDigit) }, label = { Text("Номер ICQ (UIN)") },
@@ -133,14 +208,25 @@ fun LoginScreen(prefs: SharedPreferences) {
 fun ContactsScreen(onOpen: (String) -> Unit) {
     val list by oscar.contacts.collectAsState()
     val my by oscar.myStatus.collectAsState()
+    val conn by oscar.conn.collectAsState()
+    val unread by oscar.unread.collectAsState()
+    val ctx = LocalContext.current
+    val pm = ctx.getSystemService(PowerManager::class.java)
+    val ignoring = pm.isIgnoringBatteryOptimizations(ctx.packageName)
     var menu by remember { mutableStateOf(false) }
     var newUin by remember { mutableStateOf("") }
+    val white = ButtonDefaults.textButtonColors(contentColor = Color.White)
+    val online = list.filter { it.status != OFFLINE }
+    val offline = list.filter { it.status == OFFLINE }
 
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("🌼 Аська", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
+        Row(Modifier.fillMaxWidth().background(AskaGreen).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Flower(Color.White, 30.dp)
+            Spacer(Modifier.width(8.dp))
+            Text("Аська", color = Color.White, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
             Box {
-                TextButton(onClick = { menu = true }) { Text(statusName(my)) }
+                TextButton(onClick = { menu = true }, colors = white) { Text(statusName(my)) }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     listOf(ST_ONLINE to "В сети", ST_AWAY to "Отошёл",
                         ST_DND to "Не беспокоить", ST_INVISIBLE to "Невидимка").forEach { (code, name) ->
@@ -148,23 +234,21 @@ fun ContactsScreen(onOpen: (String) -> Unit) {
                     }
                 }
             }
-            TextButton(onClick = { oscar.disconnect() }) { Text("Выйти") }
+            TextButton(onClick = { oscar.disconnect() }, colors = white) { Text("Выйти") }
         }
-        HorizontalDivider()
+        if (conn == Conn.RECONNECTING)
+            Text("Нет связи с сервером, переподключаюсь…", color = Color(0xFFD32F2F),
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+        if (!ignoring)
+            TextButton(onClick = {
+                ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + ctx.packageName)))
+            }) { Text("Разрешить работу в фоне без ограничений") }
         LazyColumn(Modifier.weight(1f)) {
-            items(list.sortedBy { it.status == OFFLINE }, key = { it.uin }) { c ->
-                Row(
-                    Modifier.fillMaxWidth().clickable { onOpen(c.uin) }.padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(Modifier.size(12.dp).clip(CircleShape).background(statusColor(c.status)))
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text(c.uin, style = MaterialTheme.typography.bodyLarge)
-                        Text(statusName(c.status), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
+            item { SectionTitle("В сети — ${online.size}") }
+            items(online, key = { it.uin }) { ContactRow(it, unread[it.uin] ?: 0, onOpen) }
+            item { SectionTitle("Не в сети — ${offline.size}") }
+            items(offline, key = { it.uin }) { ContactRow(it, unread[it.uin] ?: 0, onOpen) }
         }
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(newUin, { newUin = it.filter(Char::isDigit) }, label = { Text("Добавить номер") },
@@ -182,14 +266,26 @@ fun ChatScreen(uin: String, onBack: () -> Unit) {
     val msgs = all[uin].orEmpty()
     var text by remember { mutableStateOf("") }
     val state = rememberLazyListState()
+    val conn by oscar.conn.collectAsState()
+    DisposableEffect(uin) {
+        oscar.openChat = uin
+        onDispose { oscar.openChat = null }
+    }
+    LaunchedEffect(uin, msgs.size) { oscar.clearUnread(uin) }
     LaunchedEffect(msgs.size) { if (msgs.isNotEmpty()) state.animateScrollToItem(msgs.size - 1) }
 
     Column(Modifier.fillMaxSize()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("←") }
-            Text(uin, style = MaterialTheme.typography.titleMedium)
+        Row(Modifier.fillMaxWidth().background(AskaGreen).padding(horizontal = 4.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack, colors = ButtonDefaults.textButtonColors(contentColor = Color.White)) { Text("←") }
+            Flower(Color.White, 22.dp)
+            Spacer(Modifier.width(8.dp))
+            Text(uin, color = Color.White, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+            TextButton(
+                onClick = { oscar.removeContact(uin); onBack() },
+                colors = ButtonDefaults.textButtonColors(contentColor = Color.White)
+            ) { Text("Удалить") }
         }
-        HorizontalDivider()
         LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp), state = state) {
             items(msgs) { m ->
                 Box(
@@ -208,7 +304,7 @@ fun ChatScreen(uin: String, onBack: () -> Unit) {
         Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(text, { text = it }, placeholder = { Text("Сообщение") }, modifier = Modifier.weight(1f))
             Spacer(Modifier.width(8.dp))
-            Button(onClick = { oscar.sendMessage(uin, text); text = "" }, enabled = text.isNotBlank()) { Text("➤") }
+            Button(onClick = { oscar.sendMessage(uin, text); text = "" }, enabled = text.isNotBlank() && conn == Conn.ON) { Text("➤") }
         }
     }
 }
